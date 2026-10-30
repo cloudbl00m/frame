@@ -1,0 +1,34 @@
+Generating colour patches and stereo tones…
+Rendering reordered split clips…
+PASS · Video and audio tracks exist
+PASS · Duration 2.033s matches edit 2.000s
+PASS · Output is 1080p
+PASS · Colour at 0.25s: 180,40,60 (expected 180,40,60)
+PASS · Colour at 0.75s: 30,79,189 (expected 30,80,190)
+PASS · Colour at 1.25s: 180,40,60 (expected 180,40,60)
+PASS · Colour at 1.75s: 30,79,189 (expected 30,80,190)
+PASS · Audio at 0.25s: 430Hz, expected 440Hz
+PASS · Audio level preserved: RMS 0.177
+PASS · Audio at 0.75s: 880Hz, expected 880Hz
+PASS · Audio level preserved: RMS 0.177
+PASS · Audio at 1.25s: 440Hz, expected 440Hz
+PASS · Audio level preserved: RMS 0.177
+PASS · Audio at 1.75s: 880Hz, expected 880Hz
+PASS · Audio level preserved: RMS 0.177
+Rendering speed change with pitch preservation…
+PASS · Video and audio tracks exist
+PASS · Duration 1.766s matches edit 1.750s
+PASS · Output is 1080p
+PASS · Colour at 0.25s: 180,40,60 (expected 180,40,60)
+PASS · Colour at 0.625s: 30,79,189 (expected 30,80,190)
+PASS · Colour at 1s: 180,40,60 (expected 180,40,60)
+PASS · Colour at 1.5s: 30,79,189 (expected 30,80,190)
+PASS · Audio at 0.25s: 430Hz, expected 440Hz
+PASS · Audio level preserved: RMS 0.177
+PASS · Audio at 0.625s: 880Hz, expected 880Hz
+PASS · Audio level preserved: RMS 0.175
+PASS · Audio at 1s: 440Hz, expected 440Hz
+PASS · Audio level preserved: RMS 0.176
+PASS · Audio at 1.5s: 880Hz, expected 880Hz
+PASS · Audio level preserved: RMS 0.177
+ALL QUALITY TESTS PASSED
