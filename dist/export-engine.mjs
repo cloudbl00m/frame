@@ -2,7 +2,7 @@ import {Input,ALL_FORMATS,BlobSource,Output,BufferTarget,Mp4OutputFormat,WebMOut
 import {SoundTouch} from './vendor/soundtouch.mjs';
 const RATE=48000;
 const yieldUI=()=>new Promise(r=>setTimeout(r,0));
-export async function renderFilm({canvas,clips,assets,frameRate=30,draw,isCancelled=()=>false,onProgress=()=>{}}){
+export async function renderFilm({canvas,clips,assets,audioEdits=[],frameRate=30,draw,isCancelled=()=>false,onProgress=()=>{}}){
  const check=()=>{if(isCancelled())throw new DOMException('Export cancelled.','AbortError')};
  if(typeof VideoEncoder==='undefined'||typeof VideoDecoder==='undefined')throw Error('Accurate export needs WebCodecs. Open this editor in a current Chrome or Edge browser.');
  const duration=c=>(c.out-c.in)/c.speed,total=clips.reduce((n,c)=>n+duration(c),0);
@@ -17,7 +17,8 @@ export async function renderFilm({canvas,clips,assets,frameRate=30,draw,isCancel
    if(['pq','hlg','smpte2084','arib-std-b67'].includes(config?.colorSpace?.transfer))throw Error(a.name+' contains HDR colour. This editor exports SDR; use an SDR copy to avoid washed-out colours.');
    if(entry.audio&&clips.some(c=>c.assetId===a.id&&c.volume>0)&&!await entry.audio.canDecode())throw Error('This browser cannot decode the audio in '+a.name+'. Use a copy with AAC or Opus audio.');
   }
-  const hasAudio=clips.some(c=>inputs.get(c.assetId)?.audio&&c.volume>0);
+  for(const edit of audioEdits){check();if(!edit.assetId||edit.start>=total||edit.volume===0||inputs.has(edit.assetId))continue;const a=assets.find(a=>a.id===edit.assetId);if(!a)throw Error('Missing added sound. Re-upload it in Audio edits.');const input=new Input({formats:ALL_FORMATS,source:new BlobSource(a.file)});const entry={input};inputs.set(a.id,entry);entry.audio=await input.getPrimaryAudioTrack();if(!entry.audio||!await entry.audio.canDecode())throw Error('Cannot decode added sound: '+a.name+'. Try WAV, MP3 or AAC.');}
+  const hasAudio=clips.some(c=>inputs.get(c.assetId)?.audio&&c.volume>0)||audioEdits.some(e=>e.assetId&&e.volume>0&&e.start<total);
   const bitrate=Math.min(100e6,Math.max(16e6,canvas.width*canvas.height*frameRate*.32));
   const quality=new Quality({bitrate});
   let videoCodec,audioCodec,format,extension;
@@ -30,7 +31,7 @@ export async function renderFilm({canvas,clips,assets,frameRate=30,draw,isCancel
   await output.start();let base=0,frameNumber=0;
   for(let index=0;index<clips.length;index++){
    check();const c=clips[index],entry=inputs.get(c.assetId),end=base+duration(c);
-   if(hasAudio){onProgress(base/total*100,'Rendering audio · clip '+(index+1)+' of '+clips.length);await renderClipAudio({c,entry,base,end,audioSource,check});}
+   if(hasAudio){onProgress(base/total*100,'Rendering audio · clip '+(index+1)+' of '+clips.length);await renderClipAudio({c,entry,base,end,audioSource,check,audioEdits,inputs});}
    const firstFrame=frameNumber,lastFrame=Math.ceil(end*frameRate-1e-8);
    function* timestamps(){for(let f=firstFrame;f<lastFrame;f++)yield Math.min(c.out-1e-7,c.in+Math.max(0,f/frameRate-base)*c.speed)}
    const iterator=entry?new VideoSampleSink(entry.video).samplesAtTimestamps(timestamps()):null;
@@ -48,12 +49,15 @@ export async function renderFilm({canvas,clips,assets,frameRate=30,draw,isCancel
   return {blob:new Blob([target.buffer],{type:extension==='mp4'?'video/mp4':'video/webm'}),extension,fps:frameRate,audioLabel:hasAudio?'48 kHz stereo':'No source audio'};
  }catch(e){if(output)await output.cancel().catch(()=>{});throw e}finally{for(const {input} of inputs.values())input.dispose()}
 }
-async function renderClipAudio({c,entry,base,end,audioSource,check}){
+async function renderClipAudio({c,entry,base,end,audioSource,check,audioEdits,inputs}){
  const startSample=Math.round(base*RATE),endSample=Math.round(end*RATE),wanted=endSample-startSample;
  let written=0;
  async function emit(data){check();const frames=Math.min(data.length/2,wanted-written);if(frames<=0)return;
   data=data.subarray(0,frames*2);const gain=c.volume/100;
   for(let i=0;i<frames;i++){const position=written+i;const edge=Math.min(1,position/96,(wanted-1-position)/96);data[2*i]*=gain*Math.max(0,edge);data[2*i+1]*=gain*Math.max(0,edge)}
+  const blockStart=(startSample+written)/RATE;
+  for(let i=0;i<frames;i++){const t=blockStart+i/RATE;if(audioEdits.some(e=>e.muteOriginal&&t>=e.start&&t<e.end)){data[2*i]=0;data[2*i+1]=0}}
+  await mixAddedAudio(data,blockStart,audioEdits,inputs,check);
   const sample=new AudioSample({data,format:'f32',numberOfChannels:2,sampleRate:RATE,timestamp:(startSample+written)/RATE});
   try{await audioSource.add(sample)}finally{sample.close()}written+=frames;
  }
@@ -77,5 +81,20 @@ async function renderClipAudio({c,entry,base,end,audioSource,check}){
   if(stretch){for(let i=0;i<8&&written<wanted;i++){check();stretch.inputBuffer.putSamples(new Float32Array(16384*2),0,16384);stretch.process();await drain()}}
   while(written<wanted){await emit(new Float32Array(Math.min(16384,wanted-written)*2));await yieldUI()}
  }finally{await iterator.return()}
+}
+
+
+async function mixAddedAudio(data,start,edits,inputs,check){
+ const frames=data.length/2,end=start+frames/RATE;
+ const active=edits.filter(e=>e.assetId&&e.volume>0&&e.start<end&&e.end>start&&inputs.get(e.assetId)?.audio);
+ if(!active.length)return;
+ const offline=new OfflineAudioContext(2,frames,RATE);
+ for(const edit of active){check();const from=Math.max(start,edit.start),to=Math.min(end,edit.end),offset=edit.offset||0;
+  const sourceStart=offset+from-edit.start,sourceEnd=offset+to-edit.start;
+  const sink=new AudioBufferSink(inputs.get(edit.assetId).audio),gain=offline.createGain();gain.gain.value=edit.volume/100;gain.connect(offline.destination);
+  for await(const {buffer,timestamp} of sink.buffers(sourceStart,sourceEnd)){check();const left=Math.max(sourceStart,timestamp),right=Math.min(sourceEnd,timestamp+buffer.duration);if(right<=left)continue;const node=offline.createBufferSource();node.buffer=buffer;node.connect(gain);node.start(edit.start+left-offset-start,left-timestamp,right-left)}
+ }
+ const mixed=await offline.startRendering(),l=mixed.getChannelData(0),r=mixed.getChannelData(1);
+ for(let i=0;i<frames;i++){data[2*i]=Math.max(-1,Math.min(1,data[2*i]+l[i]));data[2*i+1]=Math.max(-1,Math.min(1,data[2*i+1]+r[i]))}
 }
 
