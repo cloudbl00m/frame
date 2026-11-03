@@ -2,14 +2,14 @@ import {Input,ALL_FORMATS,BlobSource,Output,BufferTarget,Mp4OutputFormat,WebMOut
 import {SoundTouch} from './vendor/soundtouch.mjs';
 const RATE=48000;
 const yieldUI=()=>new Promise(r=>setTimeout(r,0));
-export async function renderFilm({canvas,clips,assets,audioEdits=[],frameRate=30,draw,isCancelled=()=>false,onProgress=()=>{}}){
+export async function renderFilm({canvas,clips,assets,audioEdits=[],layers=[],frameRate=30,draw,isCancelled=()=>false,onProgress=()=>{}}){
  const check=()=>{if(isCancelled())throw new DOMException('Export cancelled.','AbortError')};
  if(typeof VideoEncoder==='undefined'||typeof VideoDecoder==='undefined')throw Error('Accurate export needs WebCodecs. Open this editor in a current Chrome or Edge browser.');
  const duration=c=>(c.out-c.in)/c.speed,total=clips.reduce((n,c)=>n+duration(c),0);
  const inputs=new Map();let output,videoSource,audioSource;
  try{
   onProgress(0,'Checking video and audio tracks…');
-  for(const c of clips){check();const a=assets.find(a=>a.id===c.assetId);if(!a)throw Error('Missing media for '+c.name);if(a.type!=='video'||inputs.has(a.id))continue;
+  for(const c of [...clips,...layers]){check();const a=assets.find(a=>a.id===c.assetId);if(!a)throw Error('Missing media for '+c.name);if(a.type!=='video'||inputs.has(a.id))continue;
    const input=new Input({formats:ALL_FORMATS,source:new BlobSource(a.file)});const entry={input};inputs.set(a.id,entry);
    entry.video=await input.getPrimaryVideoTrack();entry.audio=await input.getPrimaryAudioTrack();
    if(!entry.video||!await entry.video.canDecode())throw Error('This browser cannot decode the video in '+a.name+'. Convert it to H.264 MP4 first.');
@@ -28,18 +28,26 @@ export async function renderFilm({canvas,clips,assets,audioEdits=[],frameRate=30
   const target=new BufferTarget();output=new Output({format,target});
   videoSource=new CanvasSource(canvas,{codec:videoCodec,quality,latencyMode:'quality',keyFrameInterval:2});output.addVideoTrack(videoSource,{frameRate});
   if(hasAudio){audioSource=new AudioSampleSource({codec:audioCodec,quality:new Quality({bitrate:256000})});output.addAudioTrack(audioSource)}
+  const layerFrames=new Map();
+  for(const layer of layers){
+   const entry=inputs.get(layer.assetId);if(!entry?.video)continue;
+   function* stamps(){for(let f=Math.ceil(layer.start*frameRate-1e-8);f/frameRate<Math.min(total,layer.end)-1e-8;f++)yield Math.max(0,f/frameRate-layer.start)+.00051}
+   layerFrames.set(layer.id,new VideoSampleSink(entry.video).samplesAtTimestamps(stamps()));
+  }
   await output.start();let base=0,frameNumber=0;
   for(let index=0;index<clips.length;index++){
    check();const c=clips[index],entry=inputs.get(c.assetId),end=base+duration(c);
    if(hasAudio){onProgress(base/total*100,'Rendering audio · clip '+(index+1)+' of '+clips.length);await renderClipAudio({c,entry,base,end,audioSource,check,audioEdits,inputs});}
    const firstFrame=frameNumber,lastFrame=Math.ceil(end*frameRate-1e-8);
-   function* timestamps(){for(let f=firstFrame;f<lastFrame;f++)yield Math.min(c.out-1e-7,c.in+Math.max(0,f/frameRate-base)*c.speed)}
+   function* timestamps(){for(let f=firstFrame;f<lastFrame;f++)yield Math.min(c.out-1e-7,c.in+Math.max(0,f/frameRate-base)*c.speed+.00051)}
    const iterator=entry?new VideoSampleSink(entry.video).samplesAtTimestamps(timestamps()):null;
    try{
     for(;frameNumber<lastFrame;frameNumber++){
      check();const t=frameNumber/frameRate,local=Math.max(0,t-base);let sample;
      if(iterator){const next=await iterator.next();sample=next.value;if(!sample)throw Error('Missing decoded frame in '+c.name+' at '+(c.in+local*c.speed).toFixed(3)+'s.');}
-     try{draw(c,local,sample);await videoSource.add(t,Math.min(1/frameRate,total-t));}finally{sample?.close()}
+     const active=layers.find(layer=>t>=layer.start-1e-8&&t<layer.end-1e-8);
+     let upper;
+     try{if(active&&layerFrames.has(active.id)){upper=(await layerFrames.get(active.id).next()).value;if(!upper)throw Error('Cutaway exceeds its source duration.')}draw(c,local,sample,t,upper);await videoSource.add(t,Math.min(1/frameRate,total-t));}finally{sample?.close();upper?.close()}
      if(frameNumber%8===0){onProgress(Math.min(99,t/total*100),'Rendering frames · clip '+(index+1)+' of '+clips.length+' · '+Math.round(t/total*100)+'%');await yieldUI()}
     }
    }finally{await iterator?.return()}
@@ -92,9 +100,31 @@ async function mixAddedAudio(data,start,edits,inputs,check){
  for(const edit of active){check();const from=Math.max(start,edit.start),to=Math.min(end,edit.end),offset=edit.offset||0;
   const sourceStart=offset+from-edit.start,sourceEnd=offset+to-edit.start;
   const sink=new AudioBufferSink(inputs.get(edit.assetId).audio),gain=offline.createGain();gain.gain.value=edit.volume/100;gain.connect(offline.destination);
-  for await(const {buffer,timestamp} of sink.buffers(sourceStart,sourceEnd)){check();const left=Math.max(sourceStart,timestamp),right=Math.min(sourceEnd,timestamp+buffer.duration);if(right<=left)continue;const node=offline.createBufferSource();node.buffer=buffer;node.connect(gain);node.start(edit.start+left-offset-start,left-timestamp,right-left)}
+  for await(const {buffer,timestamp} of sink.buffers(sourceStart,sourceEnd)){check();const left=Math.max(sourceStart,timestamp),right=Math.min(sourceEnd,timestamp+buffer.duration);if(right<=left)continue;const node=offline.createBufferSource();node.buffer=buffer;const envelope=offline.createGain();node.connect(envelope);envelope.connect(gain);
+   const when=Math.max(0,edit.start+left-offset-start),duration=right-left;
+   const points=[when,when+duration,edit.start+(edit.fadeIn||0)-start,edit.end-(edit.fadeOut||0)-start,(edit.start*(edit.fadeOut||0)+edit.end*(edit.fadeIn||0))/((edit.fadeIn||0)+(edit.fadeOut||0))-start].filter(n=>n>=when&&n<=when+duration).sort((a,b)=>a-b);
+   for(const point of points){const t=start+point;envelope.gain.linearRampToValueAtTime(Math.max(0,Math.min(1,edit.fadeIn?(t-edit.start)/edit.fadeIn:1,edit.fadeOut?(edit.end-t)/edit.fadeOut:1)),point)}
+   node.start(when,left-timestamp,duration)}
  }
  const mixed=await offline.startRendering(),l=mixed.getChannelData(0),r=mixed.getChannelData(1);
  for(let i=0;i<frames;i++){data[2*i]=Math.max(-1,Math.min(1,data[2*i]+l[i]));data[2*i+1]=Math.max(-1,Math.min(1,data[2*i+1]+r[i]))}
 }
 
+
+export async function inspectSource(file){
+ const input=new Input({formats:ALL_FORMATS,source:new BlobSource(file)});
+ try{const track=await input.getPrimaryVideoTrack();if(!track)return {};
+ const stats=await track.computePacketStats(120),color=await track.getColorSpace();
+ return {fps:stats.averagePacketRate,hdr:['pq','hlg','smpte2084','arib-std-b67'].includes(color?.transfer)}
+ }finally{input.dispose()}
+}
+export async function waveform(file,duration,busy=()=>false){
+ const input=new Input({formats:ALL_FORMATS,source:new BlobSource(file)}),peaks=new Float32Array(Math.max(64,Math.min(65536,Math.ceil(duration*100))));
+ try{const track=await input.getPrimaryAudioTrack();if(!track||!await track.canDecode())return null;
+ for await(const {buffer,timestamp} of new AudioBufferSink(track).buffers()){
+  while(busy())await new Promise(resolve=>setTimeout(resolve,120));
+  for(let c=0;c<buffer.numberOfChannels;c++){const channel=buffer.getChannelData(c);for(let i=0;i<channel.length;i+=4){const bin=Math.floor((timestamp+i/buffer.sampleRate)*peaks.length/duration);if(bin>=0&&bin<peaks.length)peaks[bin]=Math.max(peaks[bin],Math.abs(channel[i]))}}
+ }
+ return peaks
+ }finally{input.dispose()}
+}
